@@ -1,0 +1,6 @@
+org\example\SmsService$SmsRequest.class
+org\example\SmsService.class
+org\example\SmsService$OutgoingSmsRequest.class
+org\example\SmsService$SmsResponse.class
+org\example\DynamoDbUpdater.class
+org\example\LambdaHandler.class
