@@ -50,6 +50,18 @@ public class SmsService {
             ex.printStackTrace();
         }
     }
+    public boolean sendSmsWithRetry(String number, int noOfMeals, String mealType) {
+        int retryCount = 3;
+        for (int i = 0; i < retryCount; i++) {
+            try {
+                sendSms(number, noOfMeals, mealType);
+                return true;
+            } catch (Exception e) {
+                logger.error("Retry " + (i + 1) + " failed for SMS", e);
+            }
+        }
+        return false;
+    }
     public SmsResponse sendSms(String number, int noOfMeals, String mealType) throws Exception {
         try {
             HttpClient client = HttpClient.newHttpClient();

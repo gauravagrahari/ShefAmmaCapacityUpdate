@@ -23,7 +23,6 @@ public class LambdaHandler implements RequestHandler<Map<String,String>, String>
         } catch (Exception e) {
             throw new RuntimeException(e);
         }
-
         return "Capacities updated for meal type: " + mealType;
     }
 }

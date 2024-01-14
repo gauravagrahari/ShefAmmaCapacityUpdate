@@ -8,6 +8,8 @@ import org.slf4j.LoggerFactory;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.*;
 
 public class DynamoDbUpdater {
@@ -63,19 +65,20 @@ public class DynamoDbUpdater {
             List<Map<String, AttributeValue>> hostResults = queryHostsByMealType(mealType);
             List<WriteRequest> writeRequests = new ArrayList<>();
             SmsService smsService = new SmsService(); // Initialize SMS service
+            Map<String, Integer> hostOrderCounts = new HashMap<>(); // To track orders per host
 
             for (Map<String, AttributeValue> item : hostResults) {
+                String hostId = item.get("pk").getS();
                 String phoneNumber = item.get("phone").getS();
-
-                // Get the original capacity item for calculating the difference
                 Map<String, AttributeValue> originalCapacityItem = getOriginalCapacityItem(item, mealType);
-
-                // Calculate the difference using the original capacity item
                 int noOfOrders = calculateDifference(originalCapacityItem, mealType);
+                hostOrderCounts.put(hostId, noOfOrders);
 
-                // Send SMS with the calculated orders
-                smsService.sendSms(phoneNumber, noOfOrders, mealType);
-
+                boolean smsSent = smsService.sendSmsWithRetry(phoneNumber, noOfOrders, mealType);
+                if (!smsSent) {
+                    logger.error("Failed to send SMS for host: " + hostId);
+                    // Handle SMS sending failure as needed
+                }
                 // Create the write request with the updated capacity item
                 WriteRequest writeRequest = createBatchWriteRequest(item, mealType);
                 if (writeRequest != null) {
@@ -91,6 +94,9 @@ public class DynamoDbUpdater {
                 executeBatchUpdate(writeRequests, mealType);
             }
 
+            // Record the order tracking information
+            recordOrderTrackingInfo(hostOrderCounts, mealType);
+
             return "Capacities updated for meal type: " + mealType;
 
         } catch (Exception e) {
@@ -98,7 +104,60 @@ public class DynamoDbUpdater {
             throw e;
         }
     }
+    private void recordOrderTrackingInfo(Map<String, Integer> hostOrderCounts, String mealType) {
+        String timestamp = LocalDateTime.now().format(DateTimeFormatter.ISO_LOCAL_DATE_TIME);
+        String trackId = "orderTrack#"+mealType; // Constant pk value for all tracking records
 
+        // Prepare the attribute for host orders
+        Map<String, AttributeValue> hostOrderAttributes = new HashMap<>();
+        hostOrderCounts.forEach((hostId, orders) -> {
+            hostOrderAttributes.put(hostId, new AttributeValue().withN(String.valueOf(orders)));
+        });
+
+        Map<String, AttributeValue> itemValues = new HashMap<>();
+        itemValues.put("pk", new AttributeValue(trackId));
+        itemValues.put("sk", new AttributeValue(timestamp));
+        itemValues.put("hostOrders", new AttributeValue().withM(hostOrderAttributes)); // Using a map attribute
+        itemValues.put("mealType", new AttributeValue(mealType));
+
+        PutItemRequest putItemRequest = new PutItemRequest()
+                .withTableName(DynamoDBTableName)
+                .withItem(itemValues);
+
+        dynamoDb.putItem(putItemRequest);
+    }
+
+
+    private WriteRequest createBatchWriteRequest(Map<String, AttributeValue> item, String mealType) {
+        String capacityUUID = item.get("pk").getS().replace("host#", "capacity#");
+        Map<String, AttributeValue> keyMap = new HashMap<>();
+        keyMap.put("pk", new AttributeValue().withS(capacityUUID));
+        keyMap.put("sk", new AttributeValue().withS("capacity"));
+
+        GetItemRequest getItemRequest = new GetItemRequest().withTableName(DynamoDBTableName).withKey(keyMap);
+        Map<String, AttributeValue> originalCapacityItem = dynamoDb.getItem(getItemRequest).getItem();
+        logger.info("Original capacity item map: {}", originalCapacityItem);
+
+        // Clone the original item for modification
+        Map<String, AttributeValue> modifiedCapacityItem = new HashMap<>(originalCapacityItem);
+
+        if (!originalCapacityItem.isEmpty()) {
+            String attributeToUpdate = determineAttributeToUpdate(originalCapacityItem, mealType);
+            if (attributeToUpdate != null) {
+                String derivedKey = capitalizeFirstLetter(attributeToUpdate.replace("cur", ""));
+                int curValue = Integer.parseInt(originalCapacityItem.get(attributeToUpdate).getS());
+                int newValue = Integer.parseInt(originalCapacityItem.get(derivedKey).getS());
+
+                if (curValue < newValue) {
+                    modifiedCapacityItem.put(attributeToUpdate, new AttributeValue().withS(String.valueOf(newValue)));
+                    return new WriteRequest().withPutRequest(new PutRequest().withItem(modifiedCapacityItem));
+                } else {
+                    return null; // No update needed
+                }
+            }
+        }
+        return null;
+    }
     private Map<String, AttributeValue> getOriginalCapacityItem(Map<String, AttributeValue> item, String mealType) {
         String capacityUUID = item.get("pk").getS().replace("host#", "capacity#");
         Map<String, AttributeValue> keyMap = new HashMap<>();
@@ -130,9 +189,6 @@ public class DynamoDbUpdater {
         String currentAttribute = "cur" + mealType.toUpperCase() + "Cap";
         String maxAttribute = mealType.toLowerCase() + "Cap";
 
-        logger.info("Capacity item map: {}", capacityItem);
-        logger.info("Current attribute: {}, Max attribute: {}", currentAttribute, maxAttribute);
-
         if (!capacityItem.containsKey(currentAttribute) || !capacityItem.containsKey(maxAttribute)) {
             logger.error("Missing attribute in calculateDifference: currentAttribute={} or maxAttribute={}", currentAttribute, maxAttribute);
             return 0;
@@ -152,36 +208,6 @@ public class DynamoDbUpdater {
         return maxValue - currentValue;
     }
 
-    private WriteRequest createBatchWriteRequest(Map<String, AttributeValue> item, String mealType) {
-        String capacityUUID = item.get("pk").getS().replace("host#", "capacity#");
-        Map<String, AttributeValue> keyMap = new HashMap<>();
-        keyMap.put("pk", new AttributeValue().withS(capacityUUID));
-        keyMap.put("sk", new AttributeValue().withS("capacity"));
-
-        GetItemRequest getItemRequest = new GetItemRequest().withTableName(DynamoDBTableName).withKey(keyMap);
-        Map<String, AttributeValue> originalCapacityItem = dynamoDb.getItem(getItemRequest).getItem();
-        logger.info("Original capacity item map: {}", originalCapacityItem);
-
-        // Clone the original item for modification
-        Map<String, AttributeValue> modifiedCapacityItem = new HashMap<>(originalCapacityItem);
-
-        if (originalCapacityItem != null && !originalCapacityItem.isEmpty()) {
-            String attributeToUpdate = determineAttributeToUpdate(originalCapacityItem, mealType);
-            if (attributeToUpdate != null) {
-                String derivedKey = capitalizeFirstLetter(attributeToUpdate.replace("cur", ""));
-                int curValue = Integer.parseInt(originalCapacityItem.get(attributeToUpdate).getS());
-                int newValue = Integer.parseInt(originalCapacityItem.get(derivedKey).getS());
-
-                if (curValue < newValue) {
-                    modifiedCapacityItem.put(attributeToUpdate, new AttributeValue().withS(String.valueOf(newValue)));
-                    return new WriteRequest().withPutRequest(new PutRequest().withItem(modifiedCapacityItem));
-                } else {
-                    return null; // No update needed
-                }
-            }
-        }
-        return null;
-    }
 
     private String capitalizeFirstLetter(String input) {
         if (input == null || input.isEmpty()) {
